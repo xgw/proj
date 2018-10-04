@@ -1,5 +1,6 @@
 import os
 import logging
+import head_movement
 import numpy as np
 import multiprocessing as mp
 os.environ['CUDA_VISIBLE_DEVICES']=''
@@ -9,19 +10,21 @@ import a3c
 import load_trace
 
 
-S_INFO = 6  # bit_rate, buffer_size, next_chunk_size, bandwidth_measurement(throughput and time), chunk_til_video_end
+S_INFO = 4  # bit_rate, buffer_size, next_chunk_size, bandwidth_measurement(throughput and time), chunk_til_video_end
 S_LEN = 8  # take how many frames in the past
-A_DIM = 6
+A_DIM = 4  # 4 qp to decide
+QP_RATE = [22, 27, 32, 37]
 ACTOR_LR_RATE = 0.0001
 CRITIC_LR_RATE = 0.001
 NUM_AGENTS = 16
 TRAIN_SEQ_LEN = 100  # take as a train batch
-MODEL_SAVE_INTERVAL = 100
-VIDEO_BIT_RATE = [300,750,1200,1850,2850,4300]  # Kbps
+MODEL_SAVE_INTERVAL = 1000
+VIDEO_BIT_RATE = [750,1200,1850,2850]  # Kbps
 HD_REWARD = [1, 2, 3, 12, 15, 20]
-BUFFER_NORM_FACTOR = 10.0
+BUFFER_NORM_FACTOR = 6.0
 CHUNK_TIL_VIDEO_END_CAP = 48.0
 M_IN_K = 1000.0
+BIT_RATE_REWARD_PARAMETER = 10
 REBUF_PENALTY = 4.3  # 1 sec rebuffering -> 3 Mbps
 SMOOTH_PENALTY = 1
 DEFAULT_QUALITY = 1  # default video quality without agent
@@ -33,6 +36,7 @@ TEST_LOG_FOLDER = './test_results/'
 TRAIN_TRACES = './cooked_traces/'
 # NN_MODEL = './results/pretrain_linear_reward.ckpt'
 NN_MODEL = None
+NUM_OF_TRACKS = 10
 
 
 def testing(epoch, nn_model, log_file):
@@ -201,8 +205,8 @@ def central_agent(net_params_queues, exp_queues):
 
 def agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_queue):
 
-    net_env = env.Environment(all_cooked_time=all_cooked_time,
-                              all_cooked_bw=all_cooked_bw,
+    net_env = env.Environment(time=all_cooked_time,
+                              bandwidth=all_cooked_bw,
                               random_seed=agent_id)
 
     with tf.Session() as sess, open(LOG_FILE + '_agent_' + str(agent_id), 'wb') as log_file:
@@ -228,40 +232,44 @@ def agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_queue)
         a_batch = [action_vec]
         r_batch = []
         entropy_record = []
+        #need to initialize, and get before simulation step
+        track_index = []
+        hm = head_movement.move_prediction()
 
         time_stamp = 0
         while True:  # experience video streaming forever
 
             # the action is from the last decision
             # this is to make the framework similar to the real
-            delay, sleep_time, buffer_size, rebuf, \
-            video_chunk_size, next_video_chunk_sizes, \
-            end_of_video, video_chunk_remain = \
-                net_env.get_video_chunk(bit_rate)
+            # xgw 20180918: need to modify here
+
+            estimate_track_index = hm.get_head_movement_prediction()
+            # actual_track_index = hm.get_head_movement_current()
+            actual_track_index = [2, 3, 5, 6]
+
+
+            delay, rebuf, buffer_size, sleep_time, video_chunk_size, end_of_video = \
+                net_env.get_video_chunk(bit_rate, estimate_track_index)
 
             time_stamp += delay  # in ms
             time_stamp += sleep_time  # in ms
 
             # -- linear reward --
             # reward is video quality - rebuffer penalty - smoothness
+            # xgw 20180918: need to modify the reward, add the qualiy consistency in viewport
+            #               and the buffer
+            # actually the consistency of quality in viewport is the error of head movement prediction error
+            # so it's not sure that whether add the "quality consistency" here
+            # don't know how to modelized the qp as first input
             reward = VIDEO_BIT_RATE[bit_rate] / M_IN_K \
                      - REBUF_PENALTY * rebuf \
                      - SMOOTH_PENALTY * np.abs(VIDEO_BIT_RATE[bit_rate] -
                                                VIDEO_BIT_RATE[last_bit_rate]) / M_IN_K
+            # bit_rate_log_reward = np.log((bit_rate + 1) / A_DIM) * BIT_RATE_REWARD_PARAMETER
+            # smooth_p = np.exp(np.abs(last_bit_rate - bit_rate) / A_DIM) * SMOOTH_PENALTY
+            # reward = bit_rate - REBUF_PENALTY * rebuf - smooth_p
 
-            # -- log scale reward --
-            # log_bit_rate = np.log(VIDEO_BIT_RATE[bit_rate] / float(VIDEO_BIT_RATE[-1]))
-            # log_last_bit_rate = np.log(VIDEO_BIT_RATE[last_bit_rate] / float(VIDEO_BIT_RATE[-1]))
-
-            # reward = log_bit_rate \
-            #          - REBUF_PENALTY * rebuf \
-            #          - SMOOTH_PENALTY * np.abs(log_bit_rate - log_last_bit_rate)
-
-            # -- HD reward --
-            # reward = HD_REWARD[bit_rate] \
-            #          - REBUF_PENALTY * rebuf \
-            #          - SMOOTH_PENALTY * np.abs(HD_REWARD[bit_rate] - HD_REWARD[last_bit_rate])
-
+        
             r_batch.append(reward)
 
             last_bit_rate = bit_rate
@@ -276,12 +284,18 @@ def agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_queue)
             state = np.roll(state, -1, axis=1)
 
             # this should be S_INFO number of terms
-            state[0, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))  # last quality
-            state[1, -1] = buffer_size / BUFFER_NORM_FACTOR  # 10 sec
-            state[2, -1] = float(video_chunk_size) / float(delay) / M_IN_K  # kilo byte / ms
-            state[3, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR  # 10 sec
-            state[4, :A_DIM] = np.array(next_video_chunk_sizes) / M_IN_K / M_IN_K  # mega byte
-            state[5, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
+            # state[0, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))  # last quality
+            # state[1, -1] = buffer_size / BUFFER_NORM_FACTOR  # 6 sec
+            # state[2, -1] = float(video_chunk_size) / float(delay) / M_IN_K  # kilo byte / ms
+            # state[3, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR  # 10 sec
+            # state[4, :A_DIM] = np.array(next_video_chunk_sizes) / M_IN_K / M_IN_K  # mega byte
+            # state[5, -1] = np.minimum(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)
+
+            state[0, -1] = float(video_chunk_size) / float(delay) / M_IN_K  # kilo byte / ms
+            state[1, -1] = buffer_size / BUFFER_NORM_FACTOR  # 6 sec
+            state[2, :4] = np.array(actual_track_index)
+            state[3, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE)) # last chunk's bitrate
+            
 
             # compute action probability vector
             action_prob = actor.predict(np.reshape(state, (1, S_INFO, S_LEN)))
@@ -293,13 +307,14 @@ def agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_queue)
             entropy_record.append(a3c.compute_entropy(action_prob[0]))
 
             # log time_stamp, bit_rate, buffer_size, reward
-            log_file.write(str(time_stamp) + '\t' +
-                           str(VIDEO_BIT_RATE[bit_rate]) + '\t' +
-                           str(buffer_size) + '\t' +
-                           str(rebuf) + '\t' +
-                           str(video_chunk_size) + '\t' +
-                           str(delay) + '\t' +
-                           str(reward) + '\n')
+            log_file.write('time_stamp: ' + str(time_stamp) + '\t' +
+                           'VIDEO_BIT_RATE: ' + str(VIDEO_BIT_RATE[bit_rate]) + '\t' +
+                           'buffer_size: ' + str(buffer_size) + '\t' +
+                           'rebuf: ' + str(rebuf) + '\t' +
+                           'video_chunk_size: ' + str(video_chunk_size) + '\t' +
+                           'delay: ' + str(delay) + '\t' +
+                           'avg throughtput: ' + str(video_chunk_size / delay) + '\t' + 
+                           'reward: ' + str(reward) + '\n')
             log_file.flush()
 
             # report experience to the coordinator
@@ -363,7 +378,8 @@ def main():
                              args=(net_params_queues, exp_queues))
     coordinator.start()
 
-    all_cooked_time, all_cooked_bw, _ = load_trace.load_trace(TRAIN_TRACES)
+    trace_index = np.random.randint(1, 65)
+    all_cooked_time, all_cooked_bw= load_trace.load_trace(trace_index)
     agents = []
     for i in xrange(NUM_AGENTS):
         agents.append(mp.Process(target=agent,

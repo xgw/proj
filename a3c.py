@@ -1,12 +1,14 @@
 import numpy as np
 import tensorflow as tf
-import tensorflow.contrib.layers as tl
+import tflearn
 
 
 GAMMA = 0.99
-ENTROPY_WEIGHT = 0.1
+A_DIM = 4
+ENTROPY_WEIGHT = 0.5
 ENTROPY_EPS = 1e-6
 S_INFO = 4
+NUM_OF_TRACKS = 10
 
 
 class ActorNetwork(object):
@@ -21,8 +23,7 @@ class ActorNetwork(object):
         self.lr_rate = learning_rate
 
         # Create the actor network
-        self.inputs = tf.placeholder(tf.float32, [None, self.s_dim])
-        self.out = self.create_actor_network()
+        self.inputs, self.out = self.create_actor_network()
 
         # Get all network parameters
         self.network_params = \
@@ -60,12 +61,22 @@ class ActorNetwork(object):
 
     def create_actor_network(self):
         with tf.variable_scope('actor'):
-            hid_1 = tl.fully_connected(self.inputs, 32, activation_fn=tf.nn.softplus)
-            hid_2 = tl.fully_connected(hid_1, 16, activation_fn=tf.nn.softplus)
-            hid_3 = tl.fully_connected(hid_2, 8, activation_fn=tf.nn.softplus)
-            out = tl.fully_connected(hid_3, self.a_dim, activation_fn=tf.nn.softmax)
-            return out
+            inputs = tflearn.input_data(shape=[None, self.s_dim[0], self.s_dim[1]])
 
+            split_0 = tflearn.fully_connected(inputs[:, 0:1, -1], 128, activation='relu')
+            split_1 = tflearn.conv_1d(inputs[:, 1:2, :], 128, 4, activation='relu')
+            split_2 = tflearn.conv_1d(inputs[:, 2:3, :NUM_OF_TRACKS], 128, 4, activation='relu')
+            split_3 = tflearn.fully_connected(inputs[:, 3:4, -1], 128, activation='relu')
+
+            split_1_flat = tflearn.flatten(split_1)
+            split_2_flat = tflearn.flatten(split_2)
+
+            merge_net = tflearn.merge([split_0, split_1_flat, split_2_flat, split_3], 'concat')
+
+            dense_net_0 = tflearn.fully_connected(merge_net, 128, activation='relu')
+            out = tflearn.fully_connected(dense_net_0, self.a_dim, activation='softmax')
+
+            return inputs, out
 
     def train(self, inputs, acts, act_grad_weights):
 
@@ -112,8 +123,7 @@ class CriticNetwork(object):
         self.lr_rate = learning_rate
 
         # Create the critic network
-        self.inputs = tf.placeholder(tf.float32, [None, self.s_dim])
-        self.out = self.create_critic_network()
+        self.inputs, self.out = self.create_critic_network()
 
         # Get all network parameters
         self.network_params = \
@@ -135,7 +145,7 @@ class CriticNetwork(object):
         self.td = tf.subtract(self.td_target, self.out)
 
         # Mean square error
-        self.loss = tf.reduce_mean(tf.square(self.td_target - self.out))
+        self.loss = tflearn.mean_square(self.td_target, self.out)
 
         # Compute critic gradient
         self.critic_gradients = tf.gradients(self.loss, self.network_params)
@@ -146,12 +156,22 @@ class CriticNetwork(object):
 
     def create_critic_network(self):
         with tf.variable_scope('critic'):
-            hid_1 = tl.fully_connected(self.inputs, 32, activation_fn=tf.nn.softplus)
-            hid_2 = tl.fully_connected(hid_1, 16, activation_fn=tf.nn.softplus)
-            hid_3 = tl.fully_connected(hid_2, 8, activation_fn=tf.nn.softplus)
-            out = tl.fully_connected(hid_3, 1, activation_fn=None)
+            inputs = tflearn.input_data(shape=[None, self.s_dim[0], self.s_dim[1]])
 
-            return out
+            split_0 = tflearn.fully_connected(inputs[:, 0:1, -1], 128, activation='relu')
+            split_1 = tflearn.conv_1d(inputs[:, 1:2, :], 128, 4, activation='relu')
+            split_2 = tflearn.conv_1d(inputs[:, 2:3, :NUM_OF_TRACKS], 128, 4, activation='relu')
+            split_3 = tflearn.fully_connected(inputs[:, 3:4, -1], 128, activation='relu')
+
+            split_1_flat = tflearn.flatten(split_1)
+            split_2_flat = tflearn.flatten(split_2)
+
+            merge_net = tflearn.merge([split_0, split_1_flat, split_2_flat, split_3], 'concat')
+
+            dense_net_0 = tflearn.fully_connected(merge_net, 128, activation='relu')
+            out = tflearn.fully_connected(dense_net_0, 1, activation='linear')
+
+            return inputs, out
 
     def train(self, inputs, td_target):
         return self.sess.run([self.loss, self.optimize], feed_dict={
@@ -252,8 +272,10 @@ def build_summaries():
     tf.summary.scalar("TD_loss", td_loss)
     eps_total_reward = tf.Variable(0.)
     tf.summary.scalar("Eps_total_reward", eps_total_reward)
+    avg_entropy = tf.Variable(0.)
+    tf.summary.scalar("Avg_entropy", avg_entropy)
 
-    summary_vars = [td_loss, eps_total_reward]
+    summary_vars = [td_loss, eps_total_reward, avg_entropy]
     summary_ops = tf.summary.merge_all()
 
     return summary_ops, summary_vars
